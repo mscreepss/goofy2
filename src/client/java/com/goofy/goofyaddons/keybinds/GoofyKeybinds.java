@@ -16,6 +16,7 @@ public class GoofyKeybinds {
     public static KeyMapping stopKey;
     public static KeyMapping reloadConfigKey;
     public static KeyMapping toggleOverlayKey;
+    public static KeyMapping toggleEconomyModeKey;
 
     public static void register() {
         startKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
@@ -36,6 +37,16 @@ public class GoofyKeybinds {
                 "key.goofyaddons.toggle_overlay",
                 InputConstants.Type.KEYSYM,
                 GLFW.GLFW_KEY_G,
+                CATEGORY
+        ));
+
+        // Ekonomi HUD'unda All-time <-> Session geçişi.
+        // V tuşu TR-Q ve QWERTY düzeninde aynı fiziksel konumda olduğu için
+        // reloadConfigKey'deki gibi bir düzen düzeltmesine gerek yok.
+        toggleEconomyModeKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                "key.goofyaddons.toggle_economy_mode",
+                InputConstants.Type.KEYSYM,
+                GLFW.GLFW_KEY_V,
                 CATEGORY
         ));
 
