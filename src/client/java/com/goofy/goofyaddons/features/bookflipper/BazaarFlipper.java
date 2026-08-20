@@ -16,6 +16,38 @@ import java.lang.reflect.Field;
 import java.util.*;
 
 
+/**
+ * BazaarFlipper - tick tabanlı bazaar kitap flip makrosu.
+ *
+ * ÖKSÜZ PARÇA HAKKINDA (eski "temizlik modu" TAMAMEN kaldırıldı):
+ * pendingCleanupNames / activeCleanupTask / calculateTopUpAmount / findBaseLevelEntry /
+ * pruneStaleCleanupFlags mekanizmasının tamamı silindi. Onun yerine öksüz parçayı
+ * ÜRETEN sebepler kapatıldı:
+ *
+ *  1) SAYIM DİSİPLİNİ (mal sahipliği): Kitaplar fiziksel olarak birbirinden ayırt
+ *     edilemediği için sahiplik ADETLE tutulur. STORE artık envanterdeki TÜM
+ *     eşleşen kitapları değil, yalnızca o görevin kendi sayısı (inInventory) kadar
+ *     kitabı depolar; ANVIL de depodan yalnızca kendi sayısı (inEnderChest) kadar
+ *     kitap çeker. Eskiden 2to5 görevi STORE'a düştüğünde, 1to5 zincirinin taze
+ *     ürettiği Wisdom II'leri de kendi stoğu sanıp ender chest'e gömüyordu; zincir
+ *     yarıda kalıyor ve o kitaplar öksüz kalıyordu.
+ *     ÖNEMLİ: İki zincir birbirini BEKLEMEZ. 16xI tek başına 1 adet V, 8xII tek
+ *     başına 1 adet V eder - her iki havuz da tek başına tam 2'nin kuvvetidir,
+ *     dolayısıyla 1to5, 2to5'in siparişinin dolmasını beklemek zorunda değildir.
+ *  2) ZİNCİR SIRASINDA YENİ SİPARİŞ YOK: Zincirdeki bir isim için processData
+ *     yeni görev açmaz; yoksa gelen taban seviye kitaplar havuzu tek sayıya
+ *     düşürür ve her katta bir öksüz doğurur.
+ *  3) DOĞRU SİPARİŞ MİKTARI: Elde zaten duran ara seviye kitaplar (config'te kendi
+ *     girdisi olmayan seviyeler, ör. sellLevel=5 ve config {1,2} iken III/IV)
+ *     "birim" olarak sayılıp sipariş miktarından düşülür (III = 4 birim, IV = 8).
+ *     Böylece havuz toplamı her zaman tam 2'nin kuvveti olur ve birleştirme
+ *     sonunda artık kalmaz. Bu bir mod değil, sadece sipariş miktarı aritmetiği.
+ *  4) SAYAÇ KAYMASI: COMBINE sayaçları her state değişiminde ve pause'da sıfırlanır
+ *     (çekiçte unutulan kitap = havuzda eksik = öksüz), "Claimed" mesajı sadece
+ *     OUTBID penceresinde dinlenir, eski sipariş kayıtlarından gelen outbid
+ *     uyarıları zinciri kesemez, removeDuplicateBooks sadece SELL'deki görevleri
+ *     siler (eskiden alım fazındaki kardeş görevi de siliyordu).
+ */
 public class BazaarFlipper implements Feature {
     private enum State {
         START,
@@ -40,6 +72,14 @@ public class BazaarFlipper implements Feature {
         COMBINE,
         SELL
     }
+
+    /** Alım fazı: bu fazdayken o isim için birleştirme zinciri BAŞLAMAZ. */
+    private static final EnumSet<BookState> BUY_PHASE = EnumSet.of(
+            BookState.SELECTED, BookState.BUY_ORDER, BookState.OUTBID, BookState.STORE);
+
+    /** Birleştirme/satış zinciri: bu fazdayken o isim için YENİ sipariş açılmaz. */
+    private static final EnumSet<BookState> CHAIN_PHASE = EnumSet.of(
+            BookState.ANVIL, BookState.COMBINE, BookState.SELL);
 
     public boolean enabled = false;
 
@@ -73,15 +113,6 @@ public class BazaarFlipper implements Feature {
 
     private final Map<Book, Task> task = new LinkedHashMap<>();
 
-    // Öksüz parça tespit edilen ama mevcut siparişlerin (1to5/2to5) hâlâ bitmesini
-    // beklediğimiz isimler. Bu isimlerden hiçbir YENİ sipariş (temizlik siparişi
-    // hariç) açılmaz, ama mevcut çalışan siparişler kesilmeden bitene kadar sürer.
-    private final Set<String> pendingCleanupNames = new HashSet<>();
-    // Bir isim için şu an aktif olan temizlik siparişinin hangi Book olduğunu tutar.
-    // Bu, "temizlik siparişi bitti mi yoksa sadece normal bir sipariş mi bitti"yi
-    // ayırt etmek için gerekli.
-    private final Map<String, Book> activeCleanupTask = new HashMap<>();
-
     private void debug(String msg) {
         ChatUtils.debugMessage("[" + state + "] " + msg);
     }
@@ -95,6 +126,7 @@ public class BazaarFlipper implements Feature {
                     + " remaining=" + t.getAmountToOrder()
                     + " inv=" + t.inInventory
                     + " ec=" + t.inEnderChest
+                    + " credit=" + t.unitCredit
                     + " early=" + t.earlyAction);
         }
         debug("---------------------");
@@ -130,20 +162,19 @@ public class BazaarFlipper implements Feature {
         ChatUtils.clientMessage("BazaarFlipper: Stopped");
 
         task.clear();
-        pendingCleanupNames.clear();
-        activeCleanupTask.clear();
         enabled = false;
         state = State.IDLE;
         lastState = null;
         flipItemsList.clear();
         activeBook = null;
-        counter = 0;
-        clickedOnce = false;
+        resetCombineCounters();
         clock.stop();
         bazaarMonitor.stop();
         bazaarMonitor.reset();
         isInventoryFull = false;
         didRemoveOrder = false;
+        claimedItems = false;
+        didReceiveItems = false;
         useSecondPage = false;
         secondPageCheck = false;
 
@@ -152,6 +183,10 @@ public class BazaarFlipper implements Feature {
     @Override
     public void pause() {
         enabled = false;
+        // Duraklatma (ör. ScheduledReboot) sırasında çekiçte yarım kalmış bir
+        // birleştirme olabilir; sayaçlar devam eden tura sızarsa bot 1 kitapla
+        // "2 kitap kondu" sanıp çıktı slotuna basıyor ve o kitap havuzdan düşüyor.
+        resetCombineCounters();
     }
 
     @Override
@@ -191,6 +226,12 @@ public class BazaarFlipper implements Feature {
                 if ((containerCheck("Ender Chest") || containerCheck("Jumbo Backpack") || containerCheck("Greater Backpack")) && clock.shouldFire()) {
                     List<Book> bookList = new ArrayList<>();
                     bookList.addAll(booksInState(BookState.SELECTED));
+
+                    // Depoda (bu sayfada) duran, hiçbir görevin stoğu olmayan ara seviye
+                    // artıkları birim olarak sipariş miktarından düş. Envanterdeki
+                    // artıklar processData'da zaten düşüldüğü için burada SADECE
+                    // container taranır - çift sayım olmasın.
+                    creditLeftoverUnitsFromContainer(bookList);
 
                     for (Book book : bookList) {
                         debug("BazaarFlipper: [STARTUP_CHECK] book: " + book.name());
@@ -238,10 +279,6 @@ public class BazaarFlipper implements Feature {
                     return;
                 }
 
-                // Temizlik (öksüz parça) bayrakları, sahibi olan görev artık yoksa
-                // burada da serbest bırakılır - detay için pruneStaleCleanupFlags().
-                pruneStaleCleanupFlags();
-
                 if (notEnoughCash) {
                     debug("notEnoughCash is true");
                     if (!task.isEmpty()) {
@@ -288,7 +325,17 @@ public class BazaarFlipper implements Feature {
                 }
 
 
-                List<Book> booksToAnvil = booksInState(BookState.ANVIL);
+                // Zincir, kardeş görevin (ör. 2to5) siparişinin dolmasını BEKLEMEZ.
+                // Sadece o isme ait kitaplar şu anda envanterde depolanmayı bekliyorsa
+                // (BookState.STORE) birkaç tick geciktirilir; yoksa birleştirme sırasında
+                // üretilen ara seviye kitaplarla fiziksel olarak karışırlar. IDLE zaten
+                // STORE'u ANVIL'den önce işlediği için bu gecikme birkaç tıklama sürer.
+                List<Book> booksToAnvil = chainReadyBooksInState(BookState.ANVIL);
+                if (booksToAnvil.isEmpty() && !booksInState(BookState.ANVIL).isEmpty()) {
+                    debug("ANVIL kisa sureli bekliyor: ayni isimden depolanmayi bekleyen kitap var");
+                    return;
+                }
+
                 if (!booksToAnvil.isEmpty()) {
                     isInventoryFull = false;
                     boolean shouldCheck = false;
@@ -419,6 +466,11 @@ public class BazaarFlipper implements Feature {
                             return;
                         }
 
+                        // Sipariş ortada yok (doldu ya da iptal edildi): izlemeyi bırak.
+                        // Eskiden monitor kaydı kalıyordu ve saatler sonra sahte bir
+                        // outbid uyarısı gönderip görevi birleştirme zincirinin
+                        // ortasında OUTBID'e atıyordu - havuz bölünüp öksüz doğuyordu.
+                        bazaarMonitor.finish(bookToHandle);
 
                         editStateBook(bookToHandle, task.get(bookToHandle).isCompleted() ? BookState.ANVIL : BookState.SELECTED);
                         didRemoveOrder = false;
@@ -485,42 +537,51 @@ public class BazaarFlipper implements Feature {
                         return;
                     }
 
+                    Task storeTask = task.get(bookToHandle);
                     List<Integer> slots = new ArrayList<>();
                     slots.addAll(inventoryScanner.findLoreInv(bookToHandle.getRomanLevel(bookToHandle.level())));
-                    if (!slots.isEmpty()) {
+
+                    // SAYIM DİSİPLİNİ: envanterdeki her eşleşen kitabı değil, SADECE bu
+                    // görevin kendi sayısı kadarını depola. ESKİ KOD hepsini gömüyordu;
+                    // 1to5 zinciri Wisdom II üretmişken 2to5 görevi STORE'a düşerse o
+                    // kitaplar da depoya gidiyor, zincir yarıda kalıyor ve öksüz parça
+                    // doğuyordu. Kitaplar birbirinin aynı olduğu için hangi fiziksel
+                    // kitabın taşındığı önemsiz; önemli olan ADEDİN doğru olması.
+                    if (!slots.isEmpty() && storeTask.inInventory > 0) {
                         if (inventoryScanner.getEmptyContainerSlots() == 0) {
                             useSecondPage = true;
-                            task.get(bookToHandle).setShouldCheckSecondPage(true);
+                            storeTask.setShouldCheckSecondPage(true);
                             minecraft.player.closeContainer();
                             return;
                         }
 
                         InventoryUtils.clickSlot(slots.getFirst(), true);
-                        debug("storing " + bookToHandle.name() + " at slot " + slots.getFirst());
-                        task.get(bookToHandle).addInInventory(-1);
-                        task.get(bookToHandle).addInEnderChest(1);
+                        debug("storing " + bookToHandle.name() + " at slot " + slots.getFirst() + " (kalan kendi payi: " + (storeTask.inInventory - 1) + ")");
+                        storeTask.addInInventory(-1);
+                        storeTask.addInEnderChest(1);
+                        return;
                     }
-                    if (slots.isEmpty()) {
-                        if (task.get(bookToHandle).isEarlyAction()) {
-                            editStateBook(bookToHandle, BookState.OUTBID);
-                            task.get(bookToHandle).setEarlyAction(false);
-                            return;
-                        }
 
-                        if (task.get(bookToHandle).isEarlyStore()) {
-                            editStateBook(bookToHandle, BookState.SELECTED);
-                            task.get(bookToHandle).setEarlyStore(false);
-                            return;
-                        }
-
-                        editStateBook(bookToHandle, BookState.BUY_ORDER);
-                        debug("slot is empty adding book to " + "BUY_ORDER");
+                    // Kendi payımız bitti (ya da envanterde bu kitaptan kalmadı).
+                    if (storeTask.isEarlyAction()) {
+                        editStateBook(bookToHandle, BookState.OUTBID);
+                        storeTask.setEarlyAction(false);
+                        return;
                     }
+
+                    if (storeTask.isEarlyStore()) {
+                        editStateBook(bookToHandle, BookState.SELECTED);
+                        storeTask.setEarlyStore(false);
+                        return;
+                    }
+
+                    editStateBook(bookToHandle, BookState.BUY_ORDER);
+                    debug("kendi payimiz depolandi, BUY_ORDER'a geciliyor");
                 }
             }
 
             case ANVIL -> {
-                Book bookToHandle = firstBookInState(BookState.ANVIL);
+                Book bookToHandle = chainReadyBookInState(BookState.ANVIL);
 
                 if (bookToHandle == null) {
                     minecraft.player.closeContainer();
@@ -541,37 +602,67 @@ public class BazaarFlipper implements Feature {
 
                     if (containerCheck("Ender Chest") || containerCheck("Jumbo Backpack") || containerCheck("Greater Backpack")) clock.start(speedMode());
                     if ((containerCheck("Ender Chest") || containerCheck("Jumbo Backpack") || containerCheck("Greater Backpack")) && clock.shouldFire()) {
+                    Task currentTask = task.get(bookToHandle);
                     List<Integer> slots = new ArrayList<>();
 
                     slots.addAll(inventoryScanner.findLoreContainer(bookToHandle.getRomanLevel(bookToHandle.level())));
 
-                    if (slots.size() > inventoryScanner.getEmptyInventorySlots()) {
+                    // Depoda kaç tane olduğu değil, BİZİM kaç tane çekeceğimiz önemli:
+                    // slots listesi bir önceki turdan kalmış ya da başka bir göreve ait
+                    // kitapları da içerebilir, hepsini sığdırmaya çalışıp boşuna
+                    // COMBINE'a kaçmayalım.
+                    int booksToPull = Math.min(slots.size(), Math.max(0, currentTask.inEnderChest));
+
+                    if (booksToPull > inventoryScanner.getEmptyInventorySlots()) {
                         state = State.COMBINE;
                         minecraft.player.closeContainer();
                         return;
                     }
 
-                    debug("found " + slots.size() + " book slots in ender chest");
-                    if (slots.isEmpty() && task.get(bookToHandle).isShouldCheckSecondPage() && !(task.get(bookToHandle).inInventory == task.get(bookToHandle).amountToOrder)) {
-                        minecraft.player.closeContainer();
-                        task.get(bookToHandle).setShouldCheckSecondPage(false);
+                    debug("found " + slots.size() + " book slots in ender chest, kendi payimiz: " + booksToPull);
+
+                    // SAYIM DİSİPLİNİ: depodaki her eşleşen kitabı değil, SADECE bu
+                    // görevin kendi sayısı (inEnderChest) kadarını çek. Aksi halde
+                    // kardeş görevin (ör. 2to5) depodaki stoğu da havuza karışıyor,
+                    // toplam 2'nin kuvveti olmaktan çıkıyor ve zincir sonunda artık
+                    // (öksüz parça) kalıyordu.
+                    if (!slots.isEmpty() && currentTask.inEnderChest > 0) {
+                        debug("pulling slot " + slots.getFirst() + " from ender chest (kalan kendi payi: " + (currentTask.inEnderChest - 1) + ")");
+                        InventoryUtils.clickSlot(slots.getFirst(), true);
+                        currentTask.addInInventory(1);
+                        currentTask.addInEnderChest(-1);
                         return;
                     }
 
-                    if (slots.isEmpty() || task.get(bookToHandle).inInventory == task.get(bookToHandle).amountToOrder) {
-                        editStateBook(bookToHandle, BookState.COMBINE);
+                    // Taban seviye bitti. Depoda bu isme ait, hiçbir görevin stoğu
+                    // olmayan ara seviye artık varsa (III/IV) onları da envantere al -
+                    // birleştirme havuzuna katılsınlar, depoda çürümesinler. Sayaçlara
+                    // dokunulmaz, çünkü bu artıklar sipariş miktarından zaten düşüldü.
+                    List<Integer> leftovers = leftoverContainerSlots(bookToHandle);
+                    if (!leftovers.isEmpty() && inventoryScanner.getEmptyInventorySlots() > 0) {
+                        debug("pulling leftover intermediate book from slot " + leftovers.getFirst());
+                        InventoryUtils.clickSlot(leftovers.getFirst(), true);
                         return;
                     }
-                    debug("pulling slot " + slots.getFirst() + " from ender chest");
-                    InventoryUtils.clickSlot(slots.getFirst(), true);
-                    task.get(bookToHandle).addInInventory(1);
-                    task.get(bookToHandle).addInEnderChest(-1);
+
+                    // Bu sayfada bir şey kalmadı ama depoda hâlâ bekleyen kitap var:
+                    // diğer sayfaya geç. (ESKİ KOD burada "inInventory == amountToOrder"
+                    // eşitliğine bakıyordu; sayaç hedefi bir kez aşınca bu eşitlik asla
+                    // tutmuyor ve bot depoyu boşaltana kadar kitap çekiyordu - havuz
+                    // tek sayıya kayıp öksüz parça üretiyordu.)
+                    if (currentTask.isShouldCheckSecondPage() && currentTask.inEnderChest > 0) {
+                        minecraft.player.closeContainer();
+                        currentTask.setShouldCheckSecondPage(false);
+                        return;
+                    }
+
+                    editStateBook(bookToHandle, BookState.COMBINE);
                 }
             }
 
             case COMBINE -> {
 
-                Book bookToHandle = firstBookInState(BookState.COMBINE);
+                Book bookToHandle = chainReadyBookInState(BookState.COMBINE);
 
                 if (bookToHandle == null) {
                     state = State.SELL;
@@ -596,11 +687,8 @@ public class BazaarFlipper implements Feature {
                 if (containerCheck("Anvil") && counter < 2) clock.start(speedMode());
                 if (containerCheck("Anvil") && counter < 2 && clock.shouldFire()) {
                     if (level == 0) {
-                        // ESKİ KOD: burada hiç kontrol etmeden direkt SELL'e geçiyordu.
-                        // Sorun: "birleştirilecek çift yok" != "kitap satış seviyesinde hazır".
-                        // Bazen tek bir kitap ender chest'te unutulmuş kalıyor ve bot onu asla
-                        // bulamadan sonsuz döngüye giriyordu. Şimdi önce gerçekten envanterde
-                        // satış seviyesindeki kitap var mı diye bakıyoruz.
+                        // "Birleştirilecek çift yok" != "kitap satış seviyesinde hazır".
+                        // Önce gerçekten envanterde satış seviyesinde kitap var mı bak.
                         if (!inventoryScanner.locate(bookToHandle.getRomanLevel(bookToHandle.sellLevel())).isEmpty()) {
                             debug("no pair to combine, sell-level copy confirmed in inventory, switching to SELL");
                             editStateBook(bookToHandle, BookState.SELL);
@@ -608,22 +696,17 @@ public class BazaarFlipper implements Feature {
                             debug("no pair to combine AND no sell-level copy found for " + bookToHandle.name() + ", sending back to ANVIL to recheck ender chest");
                             editStateBook(bookToHandle, BookState.ANVIL);
                         } else {
-                            // ec=0, yani ender chest'te de kontrol edilecek bir şey kalmadı.
-                            // ANVIL'e geri göndermek burada sonsuz bir COMBINE<->ANVIL döngüsü
-                            // yaratıyordu (IDLE, ec=0 gördüğü için ANVIL ekranını hiç açmadan
-                            // direkt tekrar COMBINE'a atıyordu). Bunun yerine görevi tamamen
-                            // bırakıyoruz; kalan öksüz parçalar bir sonraki FETCHING turunda
-                            // "tamamlama siparişi" mekanizması tarafından otomatik yakalanıp
-                            // doğru miktarda yeni sipariş açılarak tamamlanacak.
-                            ChatUtils.clientMessage(bookToHandle.name() + " icin bu siparis tikandi (kontrol edilecek yer kalmadi), birakiliyor - kalan parcalar bir sonraki turda tamamlama siparisiyle toplanacak.");
-                            debug("dead end for " + bookToHandle.name() + ", removing task so leftover fragments get picked up by top-up logic next cycle");
+                            // Buraya normalde HİÇ düşülmemeli: havuz her zaman 2'nin
+                            // kuvveti olacak şekilde sipariş ediliyor ve zincir kilidi
+                            // sayesinde ortasından mal çekilmiyor. Yine de düşüldüyse
+                            // fiziksel bir kayıp var demektir (relog, manuel müdahale,
+                            // envanter dolduğu için yarım kalan zincir...). Sonsuz
+                            // döngüye girmemek için görevi bırakıyoruz; kalan parçalar
+                            // makro yeniden başlatıldığında STARTUP_CHECK tarafından
+                            // birim olarak sayılıp sipariş miktarından düşülecek.
+                            ChatUtils.clientMessage(bookToHandle.name() + " icin havuz eksik kaldi, gorev birakiliyor. Kalan ara seviye kitaplar makro yeniden baslatildiginda siparis miktarindan dusulecek.");
+                            debug("dead end for " + bookToHandle.name() + " - physical shortage, dropping task");
                             task.remove(bookToHandle);
-                            Book cleanupBookAtDeadEnd = activeCleanupTask.get(bookToHandle.name());
-                            if (cleanupBookAtDeadEnd != null && cleanupBookAtDeadEnd.equals(bookToHandle)) {
-                                activeCleanupTask.remove(bookToHandle.name());
-                                pendingCleanupNames.remove(bookToHandle.name());
-                                debug(bookToHandle.name() + " icin temizlik siparisi de tikandi, bayraklar sifirlaniyor ki bir sonraki tur bastan hesaplasin");
-                            }
                         }
                         return;
                     }
@@ -633,6 +716,10 @@ public class BazaarFlipper implements Feature {
 
                     if (!book.isEmpty()) {
                         if (inventoryScanner.findMisMatch(bookToHandle.getRomanLevel(level))) {
+                            // Çekiçten çıkıyoruz: içeride yarım kalmış kitap olabilir.
+                            // Sayaçları sıfırla ki bir sonraki turda "2 kitap kondu"
+                            // sanıp tek kitapla çıktıya basmayalım.
+                            resetCombineCounters();
                             minecraft.player.closeContainer();
                             return;
                         }
@@ -647,23 +734,22 @@ public class BazaarFlipper implements Feature {
 
                 // Sayıcı 2'ye ulaştıysa (2 kitap da konduysa) ve onay beklenmiyorsa saati başlat
                 if (counter == 2 && !combineConfirmPending) {
-                    combineConfirmClock.start(speedMode()); // İsterseniz buraya sabit bir milisaniye (örn: 500) yazabilirsiniz
+                    combineConfirmClock.start(speedMode());
                     combineConfirmPending = true;
                 }
-                
+
                 // Onay bekleniyorsa ve saatin süresi dolduysa tıklama işlemini yap
                 if (counter == 2 && combineConfirmPending && combineConfirmClock.shouldFire()) {
                     debug("counter==2, clicking anvil output slot 22 with normal click");
                     InventoryUtils.clickSlot(22, false);
-                    
+
                     if (clickedOnce) {
                         clickedOnce = false;
                         counter = 0;
-                        combineConfirmPending = false; // İşlem bittiğinde pending durumunu sıfırla
+                        combineConfirmPending = false;
                         return;
                     }
                     clickedOnce = true;
-                    // clickedOnce true olduktan sonra bir sonraki tick'te tekrar deneyebilmesi için saati yeniden başlat
                     combineConfirmClock.start(speedMode());
                 }
             }
@@ -692,7 +778,9 @@ public class BazaarFlipper implements Feature {
                 if (containerCheck("Bazaar") && clock.shouldFire()) {
 
                     for (Book book : bookList) {
-                        slots.addAll(inventoryScanner.findContainer("SELL " + book.getRomanLevel(5)));
+                        // ESKİ KOD: getRomanLevel(5) sabitti; sellLevel 5 değilse satış
+                        // slotu hiç bulunamıyor ve kitap sonsuza kadar elde kalıyordu.
+                        slots.addAll(inventoryScanner.findContainer("SELL " + book.getRomanLevel(book.sellLevel())));
                     }
                     debug("found " + slots.size() + " sell slots");
 
@@ -704,12 +792,9 @@ public class BazaarFlipper implements Feature {
                         debug("no slots found, clicking on: " + bookList.getFirst().name());
                         List<Integer> slot = inventoryScanner.findLoreInv(bookList.getFirst().getRomanLevel(bookList.getFirst().sellLevel()));
                         if (slot.isEmpty()) {
-                            // ESKİ KOD: sadece "bookList.removeFirst()" yapıyordu. bookList burada
-                            // her tick'te booksInState(...) ile yeniden oluşturulan GEÇİCİ bir liste,
-                            // gerçek "task" haritası değil. Ondan silmek hiçbir şeyi değiştirmiyordu,
-                            // bu yüzden aynı kitap her tick'te tekrar tekrar karşımıza çıkıp sonsuz
-                            // döngü yaratıyordu. Şimdi kitabın GERÇEK durumunu (task haritasındaki)
-                            // ANVIL'e geri çekiyoruz ki eksik parça ender chest'te tekrar aransın.
+                            // bookList her tick'te yeniden üretilen GEÇİCİ bir liste;
+                            // ondan silmek gerçek durumu değiştirmiyordu ve aynı kitap
+                            // sonsuz döngüye giriyordu. Gerçek durumu ANVIL'e çekiyoruz.
                             debug("sell-level copy not found for " + bookList.getFirst().name() + ", sending back to ANVIL to recheck ender chest");
                             editStateBook(bookList.getFirst(), BookState.ANVIL);
                             bookList.removeFirst();
@@ -752,25 +837,11 @@ public class BazaarFlipper implements Feature {
                         return;
                     }
 
+                    // Aynı isimden birden fazla görev aynı anda satış seviyesine
+                    // ulaştıysa (1to5 + 2to5 havuzu birlikte birleştiği için normal),
+                    // tek satış emri hepsini kapsar; o görevleri toplu kaldır.
                     removeDuplicateBooks(task);
-
-                    // ESKİ KOD: hem task.remove() hem de temizlik bayraklarının sıfırlanması
-                    // "if (task.containsKey(...))" bloğunun içindeydi. removeDuplicateBooks()
-                    // aynı isimden birden fazla kitap SELL'deyken görevi ZATEN sildiği için
-                    // bu blok atlanıyor, activeCleanupTask/pendingCleanupNames asla
-                    // temizlenmiyordu. Sonuç: o isim kalıcı olarak "temizlik modunda"
-                    // kilitleniyor ve o kitabın paralel girdilerinden (1to5 / 2to5) sadece
-                    // biri çalışmaya devam ediyordu. Artık silme ve bayrak temizliği
-                    // koşulsuz yapılıyor (task.remove yoksa zaten no-op).
                     task.remove(soldBook);
-
-                    Book cleanupBook = activeCleanupTask.get(soldBook.name());
-                    if (cleanupBook != null && cleanupBook.equals(soldBook)) {
-                        activeCleanupTask.remove(soldBook.name());
-                        pendingCleanupNames.remove(soldBook.name());
-                        debug(soldBook.name() + " icin temizlik siparisi basariyla tamamlandi, normal calismaya donuluyor");
-                    }
-
                     bookList.removeFirst();
 
                 }
@@ -851,7 +922,7 @@ public class BazaarFlipper implements Feature {
         }
     }
 
-public String getStateName() {
+    public String getStateName() {
         return state.name();
     }
 
@@ -874,10 +945,20 @@ public String getStateName() {
         return task.get(book).shouldStore();
     }
 
+    private void resetCombineCounters() {
+        counter = 0;
+        clickedOnce = false;
+        combineConfirmPending = false;
+        combineConfirmClock.stop();
+    }
+
     private void lastStateCheck() {
         if (state != lastState) {
             debug("state changed: " + lastState + " -> " + state);
             clock.stop();
+            // COMBINE yarıda kesildiyse (SELL'e geçiş, outbid, mismatch, reboot...)
+            // sayaçlar bir sonraki tura sızmasın.
+            resetCombineCounters();
             lastState = state;
         }
     }
@@ -925,6 +1006,52 @@ public String getStateName() {
         return null;
     }
 
+    /**
+     * Birleştirme zinciri, KARDEŞ GÖREVİN SİPARİŞİNİ BEKLEMEZ - her görev tek başına
+     * zaten tam 2'nin kuvveti kadar birim toplar (16xI -> 1 adet V, 8xII -> 1 adet V).
+     * Tek beklediği şey, o isme ait kitapların envanterde depolanmayı bekliyor
+     * olmaması: aksi halde birleştirme sırasında üretilen ara seviye kitaplarla
+     * fiziksel olarak karışırlar. IDLE zaten STORE'u ANVIL'den önce işlediği için
+     * bu bekleme birkaç tıklama sürer, sipariş dolmasını beklemez.
+     */
+    private Book chainReadyBookInState(BookState target) {
+        for (Map.Entry<Book, Task> entry : task.entrySet()) {
+            if (entry.getValue().getBookState() != target) continue;
+            if (hasUnstoredBooksForName(entry.getKey().name())) continue;
+            return entry.getKey();
+        }
+        return null;
+    }
+
+    private List<Book> chainReadyBooksInState(BookState target) {
+        List<Book> result = new ArrayList<>();
+        for (Map.Entry<Book, Task> entry : task.entrySet()) {
+            if (entry.getValue().getBookState() != target) continue;
+            if (hasUnstoredBooksForName(entry.getKey().name())) continue;
+            result.add(entry.getKey());
+        }
+        return result;
+    }
+
+    /** Bu isme ait, şu an envanterde depolanmayı bekleyen kitap var mı? */
+    private boolean hasUnstoredBooksForName(String name) {
+        for (Map.Entry<Book, Task> entry : task.entrySet()) {
+            if (!entry.getKey().name().equals(name)) continue;
+            if (entry.getValue().getBookState() != BookState.STORE) continue;
+            if (entry.getValue().inInventory > 0) return true;
+        }
+        return false;
+    }
+
+    /** Bu isim şu an birleştirme/satış zincirinde mi? */
+    private boolean isNameInChain(String name) {
+        for (Map.Entry<Book, Task> entry : task.entrySet()) {
+            if (!entry.getKey().name().equals(name)) continue;
+            if (CHAIN_PHASE.contains(entry.getValue().getBookState())) return true;
+        }
+        return false;
+    }
+
     private void removeDuplicateBooks(Map<Book, Task> tasks) {
         Map<String, Integer> counts = new HashMap<>();
         List<Book> stateBooks = new ArrayList<>();
@@ -936,42 +1063,18 @@ public String getStateName() {
             counts.merge(book.name(), 1, Integer::sum);
         }
 
+        // ESKİ KOD: isim sayısı >1 ise o isimden TÜM görevleri siliyordu - alım
+        // fazındaki (kitapları çoktan satın alınmış) kardeş görev de siliniyor ve
+        // o kitaplar sahipsiz kalıyordu. Artık sadece SELL'deki görevler silinir.
         tasks.entrySet().removeIf(entry ->
-                counts.getOrDefault(entry.getKey().name(), 0) > 1
+                entry.getValue().getBookState() == BookState.SELL
+                        && counts.getOrDefault(entry.getKey().name(), 0) > 1
         );
     }
 
-    private boolean hasActiveTaskForName(String name) {
-        for (Book b : task.keySet()) {
-            if (b.name().equals(name)) return true;
-        }
-        return false;
-    }
-
     /**
-     * Bu isim için config'te tanımlı 1. seviye (level()==1) kitabı bulur - tamamlama
-     * siparişi HER ZAMAN bu kitap üzerinden açılır, asla 2. seviyeden değil. Eğer
-     * 1. seviye tanımlı değilse (olmamalı ama garanti olsun diye), config'te bulunan
-     * en düşük seviyeli girişi döner.
-     */
-    private Book findBaseLevelEntry(String name) {
-        Book lowest = null;
-        for (Book b : GoofyConfig.INSTANCE.books) {
-            if (!b.name().equals(name)) continue;
-            if (b.level() == 1) return b;
-            if (lowest == null || b.level() < lowest.level()) lowest = b;
-        }
-        return lowest;
-    }
-
-    /**
-     * Bu isim için config'te KENDİ girdisi olan seviyeler (ör. "Ultimate Wise" için
-     * {1, 2} - yani hem 1to5 hem 2to5 pipeline'ı tanımlı).
-     *
-     * Bu seviyelerdeki kitaplar öksüz parça DEĞİLDİR: onların stoğu zaten kendi
-     * Task'inin sayımıyla (STARTUP_CHECK'teki inInventory/inEnderChest, dolayısıyla
-     * "16 yerine 15 sipariş" davranışı) hesaba katılıyor. Bu yüzden öksüz parça
-     * taramasında bu seviyeler atlanır.
+     * Config'te bu isim için tanımlı seviyeler (ör. "Ultimate Wise" -> {1, 2}).
+     * Bu seviyelerdeki kitaplar bir görevin meşru stoğudur, artık değildir.
      */
     private Set<Integer> configuredLevelsFor(String name) {
         Set<Integer> levels = new HashSet<>();
@@ -982,80 +1085,78 @@ public String getStateName() {
         return levels;
     }
 
-    /**
-     * Sahibi kalmamış temizlik bayraklarını serbest bırakır.
-     *
-     * ESKİ KOD: temizlik bayrakları (pendingCleanupNames / activeCleanupTask) sadece
-     * iki yerde temizleniyordu - SELL'de satış onaylanırken ve COMBINE'da çıkmaza
-     * girildiğinde. Görev başka bir yolla haritadan düşerse (ör. removeDuplicateBooks
-     * aynı isimden iki kitabı birden silerse) bayraklar sonsuza kadar takılı kalıyor,
-     * o isim kalıcı olarak temizlik moduna kilitleniyor ve paralel girdilerden
-     * (1to5 / 2to5) sadece biri çalışmaya devam ediyordu. Bu metot her IDLE tick'inde
-     * ve her FETCHING turunda çağrılarak bu kilidi çözer.
-     */
-    private void pruneStaleCleanupFlags() {
-        Iterator<Map.Entry<String, Book>> iterator = activeCleanupTask.entrySet().iterator();
-        while (iterator.hasNext()) {
-            Map.Entry<String, Book> entry = iterator.next();
-            if (task.containsKey(entry.getValue())) continue;
-            debug(entry.getKey() + " icin temizlik siparisi artik task haritasinda yok, bayraklar serbest birakiliyor");
-            pendingCleanupNames.remove(entry.getKey());
-            iterator.remove();
+    /** Bu kitap, ismi için config'te tanımlı EN DÜŞÜK seviye mi? (artık kredisi ona yazılır) */
+    private boolean isLowestConfiguredLevel(Book book) {
+        for (Book b : GoofyConfig.INSTANCE.books) {
+            if (!b.name().equals(book.name())) continue;
+            if (b.level() < book.level()) return false;
         }
+        return true;
     }
 
     /**
-     * Envanterde (SADECE envanter, ender chest'e bakmaz) bu kitabın taban seviyesi
-     * ile satış seviyesi arasında kalmış, eşi olmayan (tek/öksüz kalmış) parça var mı
-     * diye bakar. Her seviyedeki bir parça, TABAN seviyeye göre şu kadar "birim"
-     * değerinde: taban+1 = 2 birim, taban+2 = 4 birim, taban+3 = 8 birim...
-     * (2^(seviye-taban)) — çünkü o seviyeye ulaşmak için tabandan o kadar kere
-     * ikiye katlama (birleştirme) gerekti. Bulunan birimler toplanıp normal tam
-     * miktardan (örn. 16) çıkarılır, kalan sayı kadar taban seviye kitabı sipariş
-     * edilmesi gerekir. Öksüz parça yoksa null döner (normal tam sipariş açılmalı
-     * demektir).
-     *
-     * ESKİ KOD / DÜZELTME: tarama taban+1'den sellLevel'a kadar TÜM ara seviyelere
-     * bakıyordu. Config'te aynı isim için hem 1to5 hem 2to5 tanımlı olduğundan,
-     * 2to5 pipeline'ının envanterdeki tamamen normal Level 2 stoğu (satın alınmış
-     * ya da STARTUP_CHECK'te sayılmış kitaplar) "öksüz parça" sanılıyor ve isim
-     * gereksiz yere temizlik moduna alınıyordu. Artık config'te kendi girdisi olan
-     * seviyeler (configuredLevelsFor) taramanın dışında tutuluyor; yalnızca hiçbir
-     * pipeline'ın kalıcı stok tutmadığı GERÇEK ara seviyeler (ör. sellLevel=5 ve
-     * config {1,2} iken sadece 3 ve 4) öksüz sayılabiliyor.
+     * Taban ile satış seviyesi arasında kalan ve config'te KENDİ girdisi olmayan
+     * seviyeler. Bu seviyelerdeki kitaplar hiçbir görevin stoğu değildir; önceki
+     * turlardan kalmışlardır (sellLevel=5 ve config {1,2} iken: 3 ve 4).
      */
-    private Integer calculateTopUpAmount(Book book) {
-        int fullAmount = book.getQtyAmount(book.level());
-        Set<Integer> parallelLevels = configuredLevelsFor(book.name());
-        int existingUnits = 0;
-        boolean foundStray = false;
-
+    private List<Integer> leftoverLevels(Book book) {
+        Set<Integer> configured = configuredLevelsFor(book.name());
+        List<Integer> levels = new ArrayList<>();
         for (int i = book.level() + 1; i < book.sellLevel(); i++) {
-            // Bu seviyenin config'te kendi girdisi (kendi pipeline'ı) varsa, oradaki
-            // kitaplar o görevin meşru stoğudur - öksüz parça olarak sayılmaz.
-            if (parallelLevels.contains(i)) continue;
-
-            int count = inventoryScanner.findLoreInv(book.getRomanLevel(i)).size();
-            if (count > 0) {
-                foundStray = true;
-                existingUnits += count * (1 << (i - book.level()));
-            }
+            if (configured.contains(i)) continue;
+            levels.add(i);
         }
+        return levels;
+    }
 
-        if (!foundStray) return null;
+    /** Envanterdeki artıkların TABAN SEVİYE cinsinden birim değeri (III = 4, IV = 8...). */
+    private int leftoverUnitsInInventory(Book book) {
+        int units = 0;
+        for (int i : leftoverLevels(book)) {
+            int count = inventoryScanner.findLoreInv(book.getRomanLevel(i)).size();
+            if (count == 0) continue;
+            units += count * (1 << (i - book.level()));
+        }
+        return units;
+    }
 
-        int needed = fullAmount - existingUnits;
-        return Math.max(1, needed);
+    /** Depoda (açık olan sayfada) duran artık kitapların slotları. */
+    private List<Integer> leftoverContainerSlots(Book book) {
+        List<Integer> slots = new ArrayList<>();
+        for (int i : leftoverLevels(book)) {
+            slots.addAll(inventoryScanner.findLoreContainer(book.getRomanLevel(i)));
+        }
+        return slots;
+    }
+
+    /**
+     * Depodaki artıkları birim olarak sipariş miktarından düşer. Sadece o ismin
+     * en düşük seviyeli görevine yazılır ki iki paralel görev aynı artığı iki kez
+     * saymasın. Envanterdeki artıklar processData'da düşüldüğü için burada
+     * yalnızca container taranır.
+     */
+    private void creditLeftoverUnitsFromContainer(List<Book> bookList) {
+        for (Book book : bookList) {
+            if (!isLowestConfiguredLevel(book)) continue;
+            Task t = task.get(book);
+            if (t == null) continue;
+
+            int units = 0;
+            for (int i : leftoverLevels(book)) {
+                int count = inventoryScanner.findLoreContainer(book.getRomanLevel(i)).size();
+                if (count == 0) continue;
+                units += count * (1 << (i - book.level()));
+            }
+            if (units == 0) continue;
+
+            t.addUnitCredit(units);
+            debug(book.name() + " icin depoda " + units + " birimlik ara seviye kitap bulundu, siparis miktarindan dusuldu");
+        }
     }
 
     private void processData() {
         if (flipItemsList.isEmpty()) return;
         debug("item check passed");
-
-        // Sahibi kalmamış temizlik bayraklarını her turun başında serbest bırak ki
-        // bir isim kalıcı olarak temizlik modunda kilitli kalmasın.
-        pruneStaleCleanupFlags();
-
         double purse = scoreboardUtils.getPurse();
         debug("purse = " + purse);
 
@@ -1073,78 +1174,41 @@ public String getStateName() {
 
             if (task.containsKey(book)) continue;
 
-            // Bu isim daha önce "temizlik bekliyor" olarak işaretlenmediyse, öksüz
-            // parça var mı diye bak. Varsa işaretle - bu turdan itibaren bu isimden
-            // (temizlik siparişi hariç) yeni sipariş açılmayacak.
-            //
-            // DÜZELTME: tarama artık SADECE bu isim için hiçbir aktif görev yokken
-            // yapılıyor. Aksi halde paralel çalışan diğer görevin (ör. 2to5) ya da
-            // COMBINE sırasında geçici olarak üretilen ara seviye kitaplar (1to5'in
-            // 1->2->3->4 adımları) yanlışlıkla öksüz sanılıyor ve isim boş yere
-            // temizlik moduna kilitleniyordu. Aktif görev yokken envanterde duran ara
-            // seviye kitap ise gerçekten sahipsizdir - yani gerçek öksüz parçadır.
-            if (!pendingCleanupNames.contains(book.name()) && !hasActiveTaskForName(book.name())) {
-                Book baseEntryCheck = findBaseLevelEntry(book.name());
-                if (baseEntryCheck != null && calculateTopUpAmount(baseEntryCheck) != null) {
-                    pendingCleanupNames.add(book.name());
-                    debug(book.name() + " icin envanterde oksuz parca tespit edildi, temizlik moduna alindi - mevcut siparisler bitene kadar yeni siparis acilmayacak");
-                }
+            // Bu isim birleştirme/satış zincirindeyken YENİ sipariş açma: gelen taban
+            // seviye kitaplar zincirin ortasına karışıp havuzu tek sayıya düşürüyor,
+            // her katta bir öksüz parça doğuyordu.
+            if (isNameInChain(book.name())) {
+                debug(book.name() + " zincirde (birlestirme/satis), yeni siparis acilmiyor");
+                continue;
             }
 
-            if (pendingCleanupNames.contains(book.name())) {
-                if (hasActiveTaskForName(book.name())) {
-                    // Bu ismin 1to5 ve/veya 2to5 siparişi hâlâ çalışıyor - onlar
-                    // kesilmeden bitsin, şimdi hiçbir şey açmıyoruz.
-                    debug(book.name() + " icin temizlik bekleniyor, mevcut siparis(ler) bitmeden yeni siparis acilmiyor");
-                    continue;
-                }
-
-                // Bu isimden artık hiçbir aktif sipariş yok - tamamlama siparişini
-                // aç, HER ZAMAN 1. seviyeden (asla 2. seviyeden).
-                Book baseEntry = findBaseLevelEntry(book.name());
-                if (baseEntry == null) baseEntry = book;
-
-                Integer topUpAmount = calculateTopUpAmount(baseEntry);
-                if (topUpAmount == null) {
-                    // Öksüz parça artık yok (bir şekilde çözülmüş), temizlik modundan
-                    // çık, bu turda normal akışa düşsün.
-                    pendingCleanupNames.remove(book.name());
-                    activeCleanupTask.remove(book.name());
-                } else {
-                    FlipItem baseFlipItem = null;
-                    for (FlipItem fi : flipItemsList) {
-                        if (fi.book().equals(baseEntry)) {
-                            baseFlipItem = fi;
-                            break;
-                        }
-                    }
-                    if (baseFlipItem == null) {
-                        debug(baseEntry.name() + " icin fiyat verisi henuz yok, tamamlama siparisi bir sonraki tura birakiliyor");
-                        continue;
-                    }
-
-                    double unitCost = baseFlipItem.totalCost() / baseEntry.getQtyAmount(baseEntry.level());
-                    double actualCost = unitCost * topUpAmount;
-
-                    if (purse < actualCost) continue;
-
-                    purse -= actualCost;
-                    debug("new purse = " + purse);
-                    ChatUtils.clientMessage(baseEntry.name() + " icin envanterde eslenmemis parca bulundu, " + topUpAmount + " adetlik tamamlama siparisi (1. seviyeden) aciliyor.");
-                    task.put(baseEntry, new Task(topUpAmount));
-                    activeCleanupTask.put(baseEntry.name(), baseEntry);
-                    debug("new cleanup task created for " + baseEntry.name());
-                    continue;
-                }
-            }
-
-            // Normal (temiz) durum - eskisi gibi tam sipariş.
             int fullAmount = book.getQtyAmount(book.level());
-            if (purse < flipItem.totalCost()) continue;
+
+            // Elde zaten duran ara seviye artıklar birim olarak düşülür ki toplam
+            // havuz tam 2'nin kuvveti olsun ve zincir sonunda artık kalmasın.
+            int credit = isLowestConfiguredLevel(book) ? leftoverUnitsInInventory(book) : 0;
+            int amount = Math.max(0, fullAmount - credit);
+
+            double unitCost = flipItem.totalCost() / fullAmount;
+            double actualCost = unitCost * amount;
+
+            if (amount > 0 && purse < actualCost) continue;
+
             debug("User has enough money " + book.name());
-            purse -= flipItem.totalCost();
+            purse -= actualCost;
             debug("new purse = " + purse);
-            task.put(book, new Task(fullAmount));
+
+            task.put(book, new Task(amount));
+
+            if (credit > 0) {
+                ChatUtils.clientMessage(book.name() + " icin elde " + credit + " birim ara seviye kitap var, siparis " + fullAmount + " yerine " + amount + " adet aciliyor.");
+            }
+
+            if (amount <= 0) {
+                // Sipariş gerekmiyor, elde yeterli birim var: doğrudan zincire gir.
+                editStateBook(book, BookState.ANVIL);
+            }
+
             debug("new task created size:" + task.size());
         }
 
@@ -1202,12 +1266,23 @@ public String getStateName() {
     }
 
     private void handleClaimedMessage(String string) {
-        if (!didReceiveItems) {
-            didReceiveItems = true;
-        }
+        // ESKİ KOD: HER "Claimed" mesajı didReceiveItems'i açıyordu - satış claim'i,
+        // başka bir kitabın claim'i, her şey. OUTBID'deki kilit erken açılıp aynı
+        // sipariş iki kez okunuyor, sayaç şişiyor ve görev fiziksel olarak eksikken
+        // "tamamlandı" sayılıp birleştirmeye giriyordu (garanti öksüz parça).
+        if (state != State.OUTBID || !claimedItems) return;
+        didReceiveItems = true;
     }
 
     private void handleOutbid(Book book) {
+        Task t = task.get(book);
+        if (t == null || !BUY_PHASE.contains(t.getBookState())) {
+            // Görev artık alım fazında değil: eski bir sipariş kaydından gelen bu
+            // uyarı, birleştirme zincirini ortasından keserdi.
+            debug("stale outbid ignored for " + book);
+            bazaarMonitor.finish(book);
+            return;
+        }
         debug("Found outbid:" + book.getRomanLevel(book.level()));
         editStateBook(book, BookState.OUTBID);
     }
@@ -1254,10 +1329,11 @@ public String getStateName() {
         private int amountToOrder;
         private int inEnderChest;
         private int inInventory;
+        /** Elde zaten duran ara seviye kitapların taban seviye cinsinden birim değeri. */
+        private int unitCredit;
         private boolean shouldCheckSecondPage = false;
         private boolean earlyAction = false;
         private boolean earlyStore = false;
-        private boolean anvilRecheckAttempted = false;
 
         private boolean isShouldCheckSecondPage() {
             return shouldCheckSecondPage;
@@ -1293,6 +1369,11 @@ public String getStateName() {
 
         private void addInInventory(int inInventory) {
             this.inInventory += inInventory;
+        }
+
+        private void addUnitCredit(int units) {
+            this.unitCredit += units;
+            this.amountToOrder = Math.max(0, this.amountToOrder - units);
         }
 
         private int getAmountToOrder() {
