@@ -1,0 +1,67 @@
+name: Build & Release
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit SHA to run against (optional).'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.version }}-${{ steps.sha.outputs.short }}
+      release_url: ${{ steps.create_release.outputs.url }}
+      assets: ${{ steps.create_release.outputs.assets }}
+      commit_sha: ${{ steps.sha.outputs.full }}
+      commit_url: ${{ steps.sha.outputs.url }}
+      commit_msg: ${{ steps.commit_msg.outputs.msg }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Read mod version
+        id: version
+        run: |
+          VERSION=$(grep "^mod_version=" gradle.properties | cut -d'=' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Get short commit SHA
+        id: sha
+        run: |
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "full=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "url=https://github.com/${GITHUB_REPOSITORY}/commit/$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Get commit message
+        id: commit_msg
+        run: |
+          {
+            echo "msg<<EOF"
+            git log -1 --pretty=%B
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build
+        run: ./gradlew build
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}-${{ steps.sha.outputs.short }}
+          name: GoofyAddons ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            build/libs/*.jar
