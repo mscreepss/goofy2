@@ -222,8 +222,8 @@ public class BazaarFlipper implements Feature {
                     openEnderChest(false);
                 }
 
-                if (containerCheck("Ender Chest") || containerCheck("Jumbo Backpack") || containerCheck("Greater Backpack")) clock.start(randomizer());
-                if ((containerCheck("Ender Chest") || containerCheck("Jumbo Backpack") || containerCheck("Greater Backpack")) && clock.shouldFire()) {
+                if (isStorageOpen()) clock.start(randomizer());
+                if ((isStorageOpen()) && clock.shouldFire()) {
                     List<Book> bookList = new ArrayList<>();
                     bookList.addAll(booksInState(BookState.SELECTED));
 
@@ -527,8 +527,8 @@ public class BazaarFlipper implements Feature {
 
                 }
 
-                    if (containerCheck("Ender Chest") || containerCheck("Jumbo Backpack") || containerCheck("Greater Backpack")) clock.start(speedMode());
-                    if ((containerCheck("Ender Chest") || containerCheck("Jumbo Backpack") || containerCheck("Greater Backpack")) && clock.shouldFire()) {
+                    if (isStorageOpen()) clock.start(speedMode());
+                    if ((isStorageOpen()) && clock.shouldFire()) {
                     Book bookToHandle = firstBookInState(BookState.STORE);
 
                     if (bookToHandle == null) {
@@ -589,8 +589,8 @@ public class BazaarFlipper implements Feature {
                     return;
                 }
 
-                if (!containerCheck("Ender Chest") && !containerCheck("Jumbo Backpack") && !containerCheck("Greater Backpack")) clock.start(randomizer());
-                if (!containerCheck("Ender Chest") && !containerCheck("Jumbo Backpack") && !containerCheck("Greater Backpack") && clock.shouldFire()) {
+                if (!isStorageOpen()) clock.start(randomizer());
+                if (!isStorageOpen() && clock.shouldFire()) {
                     debug("no ender chest, opening it");
                     if (task.get(bookToHandle).isShouldCheckSecondPage()) {
                         openEnderChest(true);
@@ -600,8 +600,8 @@ public class BazaarFlipper implements Feature {
 
                 }
 
-                    if (containerCheck("Ender Chest") || containerCheck("Jumbo Backpack") || containerCheck("Greater Backpack")) clock.start(speedMode());
-                    if ((containerCheck("Ender Chest") || containerCheck("Jumbo Backpack") || containerCheck("Greater Backpack")) && clock.shouldFire()) {
+                    if (isStorageOpen()) clock.start(speedMode());
+                    if ((isStorageOpen()) && clock.shouldFire()) {
                     Task currentTask = task.get(bookToHandle);
                     List<Integer> slots = new ArrayList<>();
 
@@ -631,6 +631,10 @@ public class BazaarFlipper implements Feature {
                         InventoryUtils.clickSlot(slots.getFirst(), true);
                         currentTask.addInInventory(1);
                         currentTask.addInEnderChest(-1);
+                        // İlerleme kaydettik: bir sonraki takılmada iki sayfa da yeniden
+                        // taranabilsin ve COMBINE tekrar bir kez ANVIL'e yollayabilsin.
+                        currentTask.setOtherPageChecked(false);
+                        currentTask.setAnvilRecheckAttempted(false);
                         return;
                     }
 
@@ -642,18 +646,30 @@ public class BazaarFlipper implements Feature {
                     if (!leftovers.isEmpty() && inventoryScanner.getEmptyInventorySlots() > 0) {
                         debug("pulling leftover intermediate book from slot " + leftovers.getFirst());
                         InventoryUtils.clickSlot(leftovers.getFirst(), true);
+                        currentTask.setOtherPageChecked(false);
+                        currentTask.setAnvilRecheckAttempted(false);
                         return;
                     }
 
-                    // Bu sayfada bir şey kalmadı ama depoda hâlâ bekleyen kitap var:
-                    // diğer sayfaya geç. (ESKİ KOD burada "inInventory == amountToOrder"
-                    // eşitliğine bakıyordu; sayaç hedefi bir kez aşınca bu eşitlik asla
-                    // tutmuyor ve bot depoyu boşaltana kadar kitap çekiyordu - havuz
-                    // tek sayıya kayıp öksüz parça üretiyordu.)
-                    if (currentTask.isShouldCheckSecondPage() && currentTask.inEnderChest > 0) {
+                    // Bu sayfada bize ait kitap yok. DİĞER sayfaya (ec / ec 2) bir kez bak.
+                    // ESKİ KOD sadece shouldCheckSecondPage bayrağı açıksa sayfa
+                    // değiştiriyordu; bayrak kapalıyken kitaplar 2. sayfada kalmışsa
+                    // bot onları hiç göremiyor, sayaç "ec=2" derken depoda 0 buluyor ve
+                    // ANVIL <-> COMBINE arasında sonsuza kadar gidip geliyordu.
+                    if (!currentTask.isOtherPageChecked()) {
+                        currentTask.setOtherPageChecked(true);
+                        currentTask.setShouldCheckSecondPage(!currentTask.isShouldCheckSecondPage());
+                        debug("bu sayfada yok, diger sayfaya bakiliyor (secondPage=" + currentTask.isShouldCheckSecondPage() + ")");
                         minecraft.player.closeContainer();
-                        currentTask.setShouldCheckSecondPage(false);
                         return;
+                    }
+
+                    // Her iki sayfa da tarandı. FİZİKSEL GERÇEK SAYAÇTAN ÜSTÜNDÜR:
+                    // depoda bize ait kitap yoksa sayacı sıfırla, yoksa COMBINE
+                    // "depoda hâlâ kitap var" sanıp bizi tekrar buraya yollar.
+                    if (currentTask.inEnderChest > 0) {
+                        debug("sayac ec=" + currentTask.inEnderChest + " diyor ama iki sayfada da yok, sayac gercege gore sifirlaniyor");
+                        currentTask.clearEnderChest();
                     }
 
                     editStateBook(bookToHandle, BookState.COMBINE);
@@ -692,8 +708,13 @@ public class BazaarFlipper implements Feature {
                         if (!inventoryScanner.locate(bookToHandle.getRomanLevel(bookToHandle.sellLevel())).isEmpty()) {
                             debug("no pair to combine, sell-level copy confirmed in inventory, switching to SELL");
                             editStateBook(bookToHandle, BookState.SELL);
-                        } else if (task.get(bookToHandle).inEnderChest > 0) {
-                            debug("no pair to combine AND no sell-level copy found for " + bookToHandle.name() + ", sending back to ANVIL to recheck ender chest");
+                        } else if (task.get(bookToHandle).inEnderChest > 0 && !task.get(bookToHandle).isAnvilRecheckAttempted()) {
+                            // Depoyu SADECE BİR KEZ yeniden kontrol et. Sınırsız
+                            // denemek sonsuz ANVIL <-> COMBINE döngüsü demek: sayaç
+                            // "depoda kitap var" derken depo boşsa bot iki state
+                            // arasında saatlerce gidip geliyordu.
+                            task.get(bookToHandle).setAnvilRecheckAttempted(true);
+                            debug("no pair to combine AND no sell-level copy found for " + bookToHandle.name() + ", sending back to ANVIL to recheck ender chest (tek seferlik)");
                             editStateBook(bookToHandle, BookState.ANVIL);
                         } else {
                             // Buraya normalde HİÇ düşülmemeli: havuz her zaman 2'nin
@@ -1174,19 +1195,21 @@ public class BazaarFlipper implements Feature {
 
             if (task.containsKey(book)) continue;
 
-            // Bu isim birleştirme/satış zincirindeyken YENİ sipariş açma: gelen taban
-            // seviye kitaplar zincirin ortasına karışıp havuzu tek sayıya düşürüyor,
-            // her katta bir öksüz parça doğuyordu.
-            if (isNameInChain(book.name())) {
-                debug(book.name() + " zincirde (birlestirme/satis), yeni siparis acilmiyor");
-                continue;
+            // O isim birleştirme/satış zincirindeyken de sipariş AÇILIR - kardeş hattın
+            // (ör. Wisdom I) beklemesi gereksiz. Sadece SAYIMLAR yapılmaz: zincir şu an
+            // envanterde ara seviye kitaplar (III/IV) ve taban seviye kitaplar
+            // dolaştırıyor olabilir, onları "sahipsiz stok" sanıp siparişi azaltırsak
+            // havuz tek sayıya düşer. Sipariş dolduğunda o kitaplar çoktan tükenmiş olur.
+            boolean nameInChain = isNameInChain(book.name());
+            if (nameInChain) {
+                debug(book.name() + " zincirde: siparis aciliyor ama eldeki stok sayilmiyor");
             }
 
             int fullAmount = book.getQtyAmount(book.level());
 
             // Elde zaten duran ara seviye artıklar birim olarak düşülür ki toplam
             // havuz tam 2'nin kuvveti olsun ve zincir sonunda artık kalmasın.
-            int credit = isLowestConfiguredLevel(book) ? leftoverUnitsInInventory(book) : 0;
+            int credit = (isLowestConfiguredLevel(book) && !nameInChain) ? leftoverUnitsInInventory(book) : 0;
             int amount = Math.max(0, fullAmount - credit);
 
             double unitCost = flipItem.totalCost() / fullAmount;
@@ -1198,15 +1221,31 @@ public class BazaarFlipper implements Feature {
             purse -= actualCost;
             debug("new purse = " + purse);
 
-            task.put(book, new Task(amount));
+            Task newTask = new Task(amount);
+
+            // Envanterde bu kitaptan (TAM taban seviyede) sahipsiz duran varsa onları
+            // da say - böylece 8 adet lazımken elde 1 tane dururken 8 yerine 7 sipariş
+            // açılır ve havuz tek sayıya kaymaz. STARTUP_CHECK aynı sayımı ilk açılışta
+            // yaptığı için orada tekrar saymayalım diye firstStartUp'ta atlanır.
+            int onHand = (firstStartUp || nameInChain) ? 0 : inventoryScanner.findLoreInv(book.getRomanLevel(book.level())).size();
+            if (onHand > 0) {
+                newTask.addInInventory(onHand);
+                debug(book.name() + " icin envanterde " + onHand + " adet taban seviye kitap bulundu, siparis o kadar azaltildi");
+            }
+
+            task.put(book, newTask);
 
             if (credit > 0) {
                 ChatUtils.clientMessage(book.name() + " icin elde " + credit + " birim ara seviye kitap var, siparis " + fullAmount + " yerine " + amount + " adet aciliyor.");
             }
 
-            if (amount <= 0) {
-                // Sipariş gerekmiyor, elde yeterli birim var: doğrudan zincire gir.
+            if (newTask.isCompleted()) {
+                // Sipariş gerekmiyor, elde yeterli var: doğrudan zincire gir.
                 editStateBook(book, BookState.ANVIL);
+            } else if (newTask.shouldStore()) {
+                // Elde kısmi stok var: önce onu depola, sonra kalanı sipariş et.
+                editStateBook(book, BookState.STORE);
+                newTask.setEarlyStore(true);
             }
 
             debug("new task created size:" + task.size());
@@ -1227,7 +1266,7 @@ public class BazaarFlipper implements Feature {
     }
 
     private void openEnderChest(boolean useSecondPage) {
-        if (containerCheck("Ender Chest") || containerCheck("Jumbo Backpack") || containerCheck("Greater Backpack")) return;
+        if (isStorageOpen()) return;
         debug("openEnderChest");
         if (useSecondPage) {
             minecraft.player.connection.sendCommand(GoofyConfig.INSTANCE.secondPage);
@@ -1258,6 +1297,17 @@ public class BazaarFlipper implements Feature {
         if (minecraft.screen == null) return false;
         String title = minecraft.screen.getTitle().getString();
         return title.toLowerCase().contains(name.toLowerCase());
+    }
+
+    /**
+     * Depo ekranı (ender chest ya da herhangi bir sırt çantası) açık mı?
+     * ESKİ KOD sadece "Jumbo Backpack" ve "Greater Backpack" başlıklarına bakıyordu;
+     * config'te firstPage/secondPage başka bir çanta tipine ("backpack 1" gibi)
+     * ayarlanmışsa (Large/Small/Medium...) bot ekranın açıldığını hiç fark etmiyor,
+     * komutu boşuna tekrar tekrar gönderiyordu.
+     */
+    private boolean isStorageOpen() {
+        return containerCheck("Ender Chest") || containerCheck("Backpack");
     }
 
     private boolean isContainerOpen() {
@@ -1334,6 +1384,31 @@ public class BazaarFlipper implements Feature {
         private boolean shouldCheckSecondPage = false;
         private boolean earlyAction = false;
         private boolean earlyStore = false;
+        /** COMBINE takıldığında depo bir kez yeniden kontrol edildi mi? */
+        private boolean anvilRecheckAttempted = false;
+        /** ANVIL, bu takılmada depo sayfalarının ikisine de baktı mı? */
+        private boolean otherPageChecked = false;
+
+        private boolean isAnvilRecheckAttempted() {
+            return anvilRecheckAttempted;
+        }
+
+        private void setAnvilRecheckAttempted(boolean anvilRecheckAttempted) {
+            this.anvilRecheckAttempted = anvilRecheckAttempted;
+        }
+
+        private boolean isOtherPageChecked() {
+            return otherPageChecked;
+        }
+
+        private void setOtherPageChecked(boolean otherPageChecked) {
+            this.otherPageChecked = otherPageChecked;
+        }
+
+        /** Depoda bize ait kitap kalmadığı fiziksel olarak doğrulandığında çağrılır. */
+        private void clearEnderChest() {
+            this.inEnderChest = 0;
+        }
 
         private boolean isShouldCheckSecondPage() {
             return shouldCheckSecondPage;
