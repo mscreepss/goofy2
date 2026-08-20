@@ -3,5 +3,6 @@
   "key.goofyaddons.start": "Start Macro",
   "key.goofyaddons.stop": "Stop Macro",
   "key.goofyaddons.reload_config": "Reload Config",
-  "key.goofyaddons.toggle_overlay": "Toggle Overlay"
+  "key.goofyaddons.toggle_overlay": "Toggle Overlay",
+  "key.goofyaddons.toggle_economy_mode": "Toggle Economy Mode (All-time / Session)"
 }
