@@ -4,7 +4,6 @@ import com.goofy.goofyaddons.features.bookflipper.helper.Book;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import net.fabricmc.loader.api.FabricLoader;
-import org.lwjgl.glfw.GLFW;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -41,6 +40,13 @@ public class GoofyConfig {
     // Persistent bazaar economy stats (EconomyTracker)
     public double totalSpend = 0;
     public double totalEarn = 0;
+
+    /**
+     * Makronun aktif olarak çalıştığı TOPLAM süre (ms). EconomyTracker günceller;
+     * her tick yerine ~30 saniyede bir ve makro durduğunda diske yazılır.
+     * Mevcut goofyaddons.json dosyalarında bu alan yoksa 0'dan başlar.
+     */
+    public long totalUptimeMs = 0;
 
 
     public static void load() {
