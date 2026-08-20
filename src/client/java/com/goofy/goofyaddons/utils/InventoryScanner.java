@@ -11,9 +11,16 @@ import net.minecraft.world.item.component.ItemLore;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class InventoryScanner {
     private Minecraft minecraft = Minecraft.getInstance();
+
+    // "You have 5 items to claim!" -> 5
+    private static final Pattern CLAIM_AMOUNT = Pattern.compile("You have\\s+([\\d,]+)");
+    // "Unit price: 139,890.5 coins" -> 139890.5
+    private static final Pattern UNIT_PRICE = Pattern.compile("Unit price:\\s*([\\d,]+(?:\\.\\d+)?)");
 
     public List<Integer> findInv(String name) {
         List<Integer> slots = new ArrayList<>();
@@ -109,34 +116,56 @@ public class InventoryScanner {
         return slots;
     }
 
+    /**
+     * Siparişte claim edilmeyi bekleyen adet.
+     *
+     * ESKİ KOD: text.replaceAll("[^0-9]", "") satırdaki TÜM rakamları yan yana
+     * yapıştırıyordu; satırda ikinci bir sayı geçtiği anda (miktar/coin/oran)
+     * 5 yerine 51234 gibi bir değer dönüyor, bu değer görevin inInventory
+     * sayacına eklenip görev fiziksel olarak eksikken "tamamlandı" sayılıyordu.
+     * Sonuç: bot eksik havuzla birleştirmeye giriyor ve öksüz parça üretiyordu.
+     * Artık "You have" ifadesinden sonraki İLK sayı alınıp döngü kırılıyor.
+     */
     public int checkOrder(int slot) {
-        int items = 0;
         AbstractContainerMenu menu = minecraft.player.containerMenu;
         ItemStack itemStack = menu.slots.get(slot).getItem();
         ItemLore lore = itemStack.get(DataComponents.LORE);
         if (lore == null) return 0;
         for (Component line : lore.lines()) {
             String text = line.getString();
-            if (!text.contains("You have")) continue;
-            String digits = text.replaceAll("[^0-9]", "");
-            items = Integer.parseInt(digits);
+            Matcher matcher = CLAIM_AMOUNT.matcher(text);
+            if (!matcher.find()) continue;
+            try {
+                return Integer.parseInt(matcher.group(1).replace(",", ""));
+            } catch (NumberFormatException e) {
+                return 0;
+            }
         }
-        return items;
+        return 0;
     }
 
+    /**
+     * Sipariş ekranındaki birim fiyat. Eskiden satırdaki tüm rakam/nokta
+     * karakterleri birleştiriliyordu; satırda ikinci bir sayı varsa fiyat
+     * bozuluyor ve BazaarMonitor sürekli "outbid" sanıyordu (bu da siparişin
+     * durmadan iptal edilip yeniden açılmasına, havuzun bölünmesine yol açıyor).
+     */
     public double getUnitPrice(int slot) {
-        double unitPrice = 0;
         AbstractContainerMenu menu = minecraft.player.containerMenu;
         ItemStack itemStack = menu.slots.get(slot).getItem();
         ItemLore itemLore = itemStack.get(DataComponents.LORE);
         if (itemLore == null) return 0;
         for (Component line : itemLore.lines()) {
             String text = line.getString();
-            if (!text.contains("Unit price:")) continue;
-            String digits = text.replaceAll("[^0-9.]", "");
-            unitPrice = Double.parseDouble(digits);
+            Matcher matcher = UNIT_PRICE.matcher(text);
+            if (!matcher.find()) continue;
+            try {
+                return Double.parseDouble(matcher.group(1).replace(",", ""));
+            } catch (NumberFormatException e) {
+                return 0;
+            }
         }
-        return unitPrice;
+        return 0;
     }
 
     public int getEmptyInventorySlots() {
