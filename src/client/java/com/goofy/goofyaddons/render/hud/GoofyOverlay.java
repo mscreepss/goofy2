@@ -24,7 +24,7 @@ public class GoofyOverlay {
     private static final Identifier HEADER = Identifier.fromNamespaceAndPath(GoofyAddons.MOD_ID, "textures/gui/header.png");
 
     private static final int PANEL_X = 6;
-    private static final int PANEL_Y = 58; // EconomyHud'un altında durur
+    private static final int PANEL_GAP = 6; // EconomyHud panelinin altındaki boşluk
     private static final int PANEL_WIDTH = 220;
     private static final int HEADER_WIDTH = 160;
     private static final int HEADER_HEIGHT = HEADER_WIDTH * 192 / 1195;
@@ -34,6 +34,15 @@ public class GoofyOverlay {
     public static boolean visible = true;
 
     private GoofyOverlay() {
+    }
+
+    /**
+     * ESKİ KOD: PANEL_Y sabit 58'di ve EconomyHud'un 3 satırlık yüksekliğine göre
+     * elle hesaplanmıştı. EconomyHud'a uptime + mod satırı eklenince paneller üst
+     * üste biniyordu; artık konum ekonomi panelinin gerçek yüksekliğinden türetiliyor.
+     */
+    private static int panelY() {
+        return EconomyHud.PANEL_Y + EconomyHud.getPanelHeight() + PANEL_GAP;
     }
 
     public static void register() {
@@ -65,17 +74,18 @@ public class GoofyOverlay {
             taskLines = flipper.getTaskSummary();
         }
 
+        int panelY = panelY();
         int contentLines = 2 + Math.max(taskLines.size(), 1);
         int panelHeight = HEADER_HEIGHT + PADDING * 3 + (LINE_HEIGHT * contentLines);
 
-        graphics.fill(PANEL_X, PANEL_Y, PANEL_X + PANEL_WIDTH, PANEL_Y + panelHeight, 0x90252525);
-        graphics.outline(PANEL_X, PANEL_Y, PANEL_WIDTH, panelHeight, 0xFF000000);
+        graphics.fill(PANEL_X, panelY, PANEL_X + PANEL_WIDTH, panelY + panelHeight, 0x90252525);
+        graphics.outline(PANEL_X, panelY, PANEL_WIDTH, panelHeight, 0xFF000000);
 
         graphics.blit(
                 RenderPipelines.GUI_TEXTURED,
                 HEADER,
                 PANEL_X + (PANEL_WIDTH - HEADER_WIDTH) / 2,
-                PANEL_Y + PADDING,
+                panelY + PADDING,
                 0, 0,
                 HEADER_WIDTH, HEADER_HEIGHT,
                 1195, 192,
@@ -83,11 +93,15 @@ public class GoofyOverlay {
         );
 
         int textX = PANEL_X + PADDING;
-        int textY = PANEL_Y + PADDING * 2 + HEADER_HEIGHT;
+        int textY = panelY + PADDING * 2 + HEADER_HEIGHT;
 
         int statusColor = running ? 0xFF55FF55 : 0xFFFF5555;
-        graphics.text(minecraft.font, "Macro: " + (running ? "Running" : "Idle") + (running ? " [" + stateName + "]" : ""),
-                textX, textY, statusColor, false);
+        String statusText = "Macro: " + (running ? "Running" : "Idle") + (running ? " [" + stateName + "]" : "");
+        if (running && FeatureManager.INSTANCE.isPaused()) {
+            statusText = "Macro: Paused [" + stateName + "]";
+            statusColor = 0xFFFFAA00;
+        }
+        graphics.text(minecraft.font, statusText, textX, textY, statusColor, false);
         textY += LINE_HEIGHT;
 
         graphics.text(minecraft.font, "Active Book: " + activeBook, textX, textY, 0xFFAAAAAA, false);
