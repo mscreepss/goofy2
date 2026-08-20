@@ -8,6 +8,7 @@ import com.goofy.goofyaddons.features.economy.EconomyTracker;
 import com.goofy.goofyaddons.keybinds.GoofyKeybinds;
 import com.goofy.goofyaddons.render.hud.EconomyHud;
 import com.goofy.goofyaddons.render.hud.GoofyOverlay;
+import com.goofy.goofyaddons.utils.ChatUtils;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 
@@ -25,6 +26,8 @@ public class GoofyAddonsClient implements ClientModInitializer {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             FailsafeManager.INSTANCE.onTick();
             FeatureManager.INSTANCE.onTick();
+            // Uptime sayacı: makro aktif değilse süre eklemez, sadece zaman damgasını günceller.
+            EconomyTracker.onTick();
 
             while (GoofyKeybinds.reloadConfigKey.consumeClick()) {
                 GoofyConfig.load();
@@ -38,6 +41,10 @@ public class GoofyAddonsClient implements ClientModInitializer {
             }
             while (GoofyKeybinds.toggleOverlayKey.consumeClick()) {
                 GoofyOverlay.toggle();
+            }
+            while (GoofyKeybinds.toggleEconomyModeKey.consumeClick()) {
+                EconomyTracker.toggleMode();
+                ChatUtils.clientMessage("Economy HUD: " + EconomyTracker.getModeLabel() + " modu");
             }
         });
     }
