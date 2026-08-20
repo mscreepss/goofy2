@@ -238,6 +238,10 @@ public class BazaarFlipper implements Feature {
                     return;
                 }
 
+                // Temizlik (öksüz parça) bayrakları, sahibi olan görev artık yoksa
+                // burada da serbest bırakılır - detay için pruneStaleCleanupFlags().
+                pruneStaleCleanupFlags();
+
                 if (notEnoughCash) {
                     debug("notEnoughCash is true");
                     if (!task.isEmpty()) {
@@ -704,7 +708,7 @@ public class BazaarFlipper implements Feature {
                             // her tick'te booksInState(...) ile yeniden oluşturulan GEÇİCİ bir liste,
                             // gerçek "task" haritası değil. Ondan silmek hiçbir şeyi değiştirmiyordu,
                             // bu yüzden aynı kitap her tick'te tekrar tekrar karşımıza çıkıp sonsuz
-            // döngü yaratıyordu. Şimdi kitabın GERÇEK durumunu (task haritasındaki)
+                            // döngü yaratıyordu. Şimdi kitabın GERÇEK durumunu (task haritasındaki)
                             // ANVIL'e geri çekiyoruz ki eksik parça ender chest'te tekrar aransın.
                             debug("sell-level copy not found for " + bookList.getFirst().name() + ", sending back to ANVIL to recheck ender chest");
                             editStateBook(bookList.getFirst(), BookState.ANVIL);
@@ -737,29 +741,36 @@ public class BazaarFlipper implements Feature {
 
                 if (containerCheck("Confirm")) clock.start(randomizer());
                 if (containerCheck("Confirm") && clock.shouldFire()) {
-                    debug("confirm prompt, clicking slot 13 and removing " + bookList.getFirst() + " from sell list");
+                    Book soldBook = bookList.getFirst();
+                    debug("confirm prompt, clicking slot 13 and removing " + soldBook + " from sell list");
                     InventoryUtils.clickSlot(13, false);
-                    if (task.get(bookList.getFirst()).getAmountToOrder() < 0) {
-                        task.get(bookList.getFirst()).addInInventory(-bookList.getFirst().getQtyAmount(bookList.getFirst().level()));
-                        editStateBook(bookList.getFirst(), BookState.SELECTED);
+
+                    Task soldTask = task.get(soldBook);
+                    if (soldTask != null && soldTask.getAmountToOrder() < 0) {
+                        soldTask.addInInventory(-soldBook.getQtyAmount(soldBook.level()));
+                        editStateBook(soldBook, BookState.SELECTED);
                         return;
                     }
+
                     removeDuplicateBooks(task);
-                    if (task.containsKey(bookList.getFirst())) {
-                        Book soldBook = bookList.getFirst();
-                        task.remove(soldBook);
-                        // Az önce satılan kitap, o isim için çalışan temizlik siparişiyse
-                        // (öksüz parçayı tamamlayan sipariş), artık temizlik bitti demektir -
-                        // normal paralel çalışmaya (1to5 + 2to5) dönebilir. Sadece normal bir
-                        // sipariş bittiyse (temizlik hâlâ bekliyorsa) bu bayraklara dokunmuyoruz
-                        // ki bekleme devam etsin.
-                        Book cleanupBook = activeCleanupTask.get(soldBook.name());
-                        if (cleanupBook != null && cleanupBook.equals(soldBook)) {
-                            activeCleanupTask.remove(soldBook.name());
-                            pendingCleanupNames.remove(soldBook.name());
-                            debug(soldBook.name() + " icin temizlik siparisi basariyla tamamlandi, normal calismaya donuluyor");
-                        }
+
+                    // ESKİ KOD: hem task.remove() hem de temizlik bayraklarının sıfırlanması
+                    // "if (task.containsKey(...))" bloğunun içindeydi. removeDuplicateBooks()
+                    // aynı isimden birden fazla kitap SELL'deyken görevi ZATEN sildiği için
+                    // bu blok atlanıyor, activeCleanupTask/pendingCleanupNames asla
+                    // temizlenmiyordu. Sonuç: o isim kalıcı olarak "temizlik modunda"
+                    // kilitleniyor ve o kitabın paralel girdilerinden (1to5 / 2to5) sadece
+                    // biri çalışmaya devam ediyordu. Artık silme ve bayrak temizliği
+                    // koşulsuz yapılıyor (task.remove yoksa zaten no-op).
+                    task.remove(soldBook);
+
+                    Book cleanupBook = activeCleanupTask.get(soldBook.name());
+                    if (cleanupBook != null && cleanupBook.equals(soldBook)) {
+                        activeCleanupTask.remove(soldBook.name());
+                        pendingCleanupNames.remove(soldBook.name());
+                        debug(soldBook.name() + " icin temizlik siparisi basariyla tamamlandi, normal calismaya donuluyor");
                     }
+
                     bookList.removeFirst();
 
                 }
@@ -954,6 +965,46 @@ public String getStateName() {
     }
 
     /**
+     * Bu isim için config'te KENDİ girdisi olan seviyeler (ör. "Ultimate Wise" için
+     * {1, 2} - yani hem 1to5 hem 2to5 pipeline'ı tanımlı).
+     *
+     * Bu seviyelerdeki kitaplar öksüz parça DEĞİLDİR: onların stoğu zaten kendi
+     * Task'inin sayımıyla (STARTUP_CHECK'teki inInventory/inEnderChest, dolayısıyla
+     * "16 yerine 15 sipariş" davranışı) hesaba katılıyor. Bu yüzden öksüz parça
+     * taramasında bu seviyeler atlanır.
+     */
+    private Set<Integer> configuredLevelsFor(String name) {
+        Set<Integer> levels = new HashSet<>();
+        for (Book b : GoofyConfig.INSTANCE.books) {
+            if (!b.name().equals(name)) continue;
+            levels.add(b.level());
+        }
+        return levels;
+    }
+
+    /**
+     * Sahibi kalmamış temizlik bayraklarını serbest bırakır.
+     *
+     * ESKİ KOD: temizlik bayrakları (pendingCleanupNames / activeCleanupTask) sadece
+     * iki yerde temizleniyordu - SELL'de satış onaylanırken ve COMBINE'da çıkmaza
+     * girildiğinde. Görev başka bir yolla haritadan düşerse (ör. removeDuplicateBooks
+     * aynı isimden iki kitabı birden silerse) bayraklar sonsuza kadar takılı kalıyor,
+     * o isim kalıcı olarak temizlik moduna kilitleniyor ve paralel girdilerden
+     * (1to5 / 2to5) sadece biri çalışmaya devam ediyordu. Bu metot her IDLE tick'inde
+     * ve her FETCHING turunda çağrılarak bu kilidi çözer.
+     */
+    private void pruneStaleCleanupFlags() {
+        Iterator<Map.Entry<String, Book>> iterator = activeCleanupTask.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<String, Book> entry = iterator.next();
+            if (task.containsKey(entry.getValue())) continue;
+            debug(entry.getKey() + " icin temizlik siparisi artik task haritasinda yok, bayraklar serbest birakiliyor");
+            pendingCleanupNames.remove(entry.getKey());
+            iterator.remove();
+        }
+    }
+
+    /**
      * Envanterde (SADECE envanter, ender chest'e bakmaz) bu kitabın taban seviyesi
      * ile satış seviyesi arasında kalmış, eşi olmayan (tek/öksüz kalmış) parça var mı
      * diye bakar. Her seviyedeki bir parça, TABAN seviyeye göre şu kadar "birim"
@@ -963,13 +1014,27 @@ public String getStateName() {
      * miktardan (örn. 16) çıkarılır, kalan sayı kadar taban seviye kitabı sipariş
      * edilmesi gerekir. Öksüz parça yoksa null döner (normal tam sipariş açılmalı
      * demektir).
+     *
+     * ESKİ KOD / DÜZELTME: tarama taban+1'den sellLevel'a kadar TÜM ara seviyelere
+     * bakıyordu. Config'te aynı isim için hem 1to5 hem 2to5 tanımlı olduğundan,
+     * 2to5 pipeline'ının envanterdeki tamamen normal Level 2 stoğu (satın alınmış
+     * ya da STARTUP_CHECK'te sayılmış kitaplar) "öksüz parça" sanılıyor ve isim
+     * gereksiz yere temizlik moduna alınıyordu. Artık config'te kendi girdisi olan
+     * seviyeler (configuredLevelsFor) taramanın dışında tutuluyor; yalnızca hiçbir
+     * pipeline'ın kalıcı stok tutmadığı GERÇEK ara seviyeler (ör. sellLevel=5 ve
+     * config {1,2} iken sadece 3 ve 4) öksüz sayılabiliyor.
      */
     private Integer calculateTopUpAmount(Book book) {
         int fullAmount = book.getQtyAmount(book.level());
+        Set<Integer> parallelLevels = configuredLevelsFor(book.name());
         int existingUnits = 0;
         boolean foundStray = false;
 
         for (int i = book.level() + 1; i < book.sellLevel(); i++) {
+            // Bu seviyenin config'te kendi girdisi (kendi pipeline'ı) varsa, oradaki
+            // kitaplar o görevin meşru stoğudur - öksüz parça olarak sayılmaz.
+            if (parallelLevels.contains(i)) continue;
+
             int count = inventoryScanner.findLoreInv(book.getRomanLevel(i)).size();
             if (count > 0) {
                 foundStray = true;
@@ -986,6 +1051,11 @@ public String getStateName() {
     private void processData() {
         if (flipItemsList.isEmpty()) return;
         debug("item check passed");
+
+        // Sahibi kalmamış temizlik bayraklarını her turun başında serbest bırak ki
+        // bir isim kalıcı olarak temizlik modunda kilitli kalmasın.
+        pruneStaleCleanupFlags();
+
         double purse = scoreboardUtils.getPurse();
         debug("purse = " + purse);
 
@@ -1006,7 +1076,14 @@ public String getStateName() {
             // Bu isim daha önce "temizlik bekliyor" olarak işaretlenmediyse, öksüz
             // parça var mı diye bak. Varsa işaretle - bu turdan itibaren bu isimden
             // (temizlik siparişi hariç) yeni sipariş açılmayacak.
-            if (!pendingCleanupNames.contains(book.name())) {
+            //
+            // DÜZELTME: tarama artık SADECE bu isim için hiçbir aktif görev yokken
+            // yapılıyor. Aksi halde paralel çalışan diğer görevin (ör. 2to5) ya da
+            // COMBINE sırasında geçici olarak üretilen ara seviye kitaplar (1to5'in
+            // 1->2->3->4 adımları) yanlışlıkla öksüz sanılıyor ve isim boş yere
+            // temizlik moduna kilitleniyordu. Aktif görev yokken envanterde duran ara
+            // seviye kitap ise gerçekten sahipsizdir - yani gerçek öksüz parçadır.
+            if (!pendingCleanupNames.contains(book.name()) && !hasActiveTaskForName(book.name())) {
                 Book baseEntryCheck = findBaseLevelEntry(book.name());
                 if (baseEntryCheck != null && calculateTopUpAmount(baseEntryCheck) != null) {
                     pendingCleanupNames.add(book.name());
@@ -1032,6 +1109,7 @@ public String getStateName() {
                     // Öksüz parça artık yok (bir şekilde çözülmüş), temizlik modundan
                     // çık, bu turda normal akışa düşsün.
                     pendingCleanupNames.remove(book.name());
+                    activeCleanupTask.remove(book.name());
                 } else {
                     FlipItem baseFlipItem = null;
                     for (FlipItem fi : flipItemsList) {
