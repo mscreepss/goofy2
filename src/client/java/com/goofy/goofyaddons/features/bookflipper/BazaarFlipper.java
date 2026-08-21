@@ -107,6 +107,10 @@ public class BazaarFlipper implements Feature {
     private int counterBazaar = 0;
     private boolean useSecondPage = false;
     private boolean secondPageCheck = false;
+    /** Depo dolu diye sayfa BİR KEZ çevrildi mi? (iki sayfa da doluysa sonsuz döngüyü keser) */
+    private boolean storePageFlipped = false;
+    /** Depo ekranı kaç tick'tir açık? (içerik paketi gelsin diye taramayı geciktirir) */
+    private int storageOpenTicks = 0;
     private final Clock combineConfirmClock = new Clock();
     private boolean combineConfirmPending = false;
 
@@ -198,9 +202,25 @@ public class BazaarFlipper implements Feature {
     public void onTick() {
 
         if (!enabled) return;
+        // Relog / sunucu yeniden başlatması sırasında player null olabiliyor;
+        // korumasız her çağrı tick döngüsünde exception (ve crash) demek.
+        if (minecraft.player == null || minecraft.level == null) return;
 
         bazaarMonitor.onTick();
         lastStateCheck();
+
+        // FIRSATÇI DEPO TARAMASI: depo hangi sebeple açılırsa açılsın (STORE, ANVIL,
+        // STARTUP_CHECK) o açılışta BİR KEZ taranır ve hiçbir görevin sayacında
+        // olmayan kitaplar sahibi olabilecek göreve yazılır. Böylece sipariş öncesi
+        // ayrı bir "depoyu kontrol et" turu atmaya gerek kalmaz - hız kaybı olmaz.
+        // 3 tick beklenir: ekran başlığı geldikten sonra içerik paketi 1-2 tick
+        // gecikebiliyor, hemen tarasak boş konteyner görürdük.
+        if (isStorageOpen()) {
+            storageOpenTicks++;
+            if (storageOpenTicks == 3) syncOpenStoragePage();
+        } else {
+            storageOpenTicks = 0;
+        }
 
         switch (state) {
             case START -> {
@@ -308,6 +328,16 @@ public class BazaarFlipper implements Feature {
 
                 Book selectedBook = firstBookInState(BookState.SELECTED);
                 if (selectedBook != null) {
+                    // Fırsatçı depo taraması sırasında bu görev çoktan dolmuş olabilir.
+                    // "16 lazımdı, elimde 17 var" durumunda eskiden -1 adetlik anlamsız
+                    // bir sipariş açılıyordu; artık doğrudan çekiç turuna geçiyoruz.
+                    if (task.get(selectedBook).isCompleted()) {
+                        debug(selectedBook.getRomanLevel(selectedBook.level())
+                                + " icin siparise gerek yok (eksik=" + task.get(selectedBook).getAmountToOrder()
+                                + "), ANVIL'e geciliyor");
+                        editStateBook(selectedBook, BookState.ANVIL);
+                        return;
+                    }
                     debug("Found selected books, switching to BAZAAR_NAVIGATION");
                     activeBook = selectedBook;
                     debug("Active book set to: " + activeBook);
@@ -321,6 +351,7 @@ public class BazaarFlipper implements Feature {
                     state = State.STORE;
                     isInventoryFull = false;
                     useSecondPage = false;
+                    storePageFlipped = false;
                     return;
                 }
 
@@ -488,6 +519,7 @@ public class BazaarFlipper implements Feature {
                             editStateBook(bookToHandle, BookState.STORE);
                             state = State.STORE;
                             isInventoryFull = true;
+                            storePageFlipped = false;
                             minecraft.player.closeContainer();
                             return;
                         }
@@ -549,9 +581,26 @@ public class BazaarFlipper implements Feature {
                     // kitabın taşındığı önemsiz; önemli olan ADEDİN doğru olması.
                     if (!slots.isEmpty() && storeTask.inInventory > 0) {
                         if (inventoryScanner.getEmptyContainerSlots() == 0) {
-                            useSecondPage = true;
-                            storeTask.setShouldCheckSecondPage(true);
+                            // ESKİ KOD burada koşulsuz useSecondPage = true yapıyordu.
+                            // İki sayfa da doluysa aynı dolu sayfayı sonsuza kadar
+                            // açıp kapatıyordu (log: "no container, opening ender chest"
+                            // satırının saniyede 2-3 kez tekrarlaması). Artık sayfa
+                            // yalnızca BİR KEZ çevrilir, ikisi de doluysa pes edilir.
+                            if (!storePageFlipped) {
+                                storePageFlipped = true;
+                                useSecondPage = !useSecondPage;
+                                storeTask.setShouldCheckSecondPage(useSecondPage);
+                                debug("bu depo sayfasi dolu, diger sayfaya geciliyor (secondPage=" + useSecondPage + ")");
+                                minecraft.player.closeContainer();
+                                return;
+                            }
+                            ChatUtils.clientMessage("Depo tamamen dolu! " + bookToHandle.name()
+                                    + " kitaplari envanterde tutuluyor. Depoda yer acilmadan depolama yapilamaz.");
+                            storeTask.setEarlyAction(false);
+                            isInventoryFull = false;
+                            editStateBook(bookToHandle, BookState.BUY_ORDER);
                             minecraft.player.closeContainer();
+                            state = State.IDLE;
                             return;
                         }
 
@@ -559,6 +608,7 @@ public class BazaarFlipper implements Feature {
                         debug("storing " + bookToHandle.name() + " at slot " + slots.getFirst() + " (kalan kendi payi: " + (storeTask.inInventory - 1) + ")");
                         storeTask.addInInventory(-1);
                         storeTask.addInEnderChest(1);
+                        storePageFlipped = false;
                         return;
                     }
 
@@ -1253,6 +1303,48 @@ public class BazaarFlipper implements Feature {
 
     }
 
+
+    /**
+     * AÇIK OLAN depo sayfasını tarar ve hiçbir görevin sayacında olmayan kitapları
+     * sahibi olabilecek göreve yazar. Tek yönlü ve güvenlidir:
+     *
+     *  - Sadece EKLER, asla eksiltmez. Bir sayfada kitap görmemek "o kitap yok"
+     *    demek değildir (diğer sayfada olabilir). Sayaç şişmesi zaten ANVIL'de
+     *    iki sayfa da tarandıktan sonra clearEnderChest() ile düzeltiliyor.
+     *  - "Bu sayfadaki fiziksel adet > tüm görevlerin toplam iddiası" ise aradaki
+     *    fark KESİNLİKLE sahipsizdir, çünkü toplam iddia iki sayfayı birden kapsar.
+     *    En kötü ihtimalle az sayar, asla fazla saymaz. Bu yüzden tekrar tekrar
+     *    çağrılması güvenlidir: kitap deftere girdiği anda "iddia" da artar.
+     *  - Hiçbir görev ihtiyacından fazlasını almaz: 16 gerekirken depoda 17 varsa
+     *    16'sı sayaca girer, 1 tanesi sahipsiz kalır ve eksik 0 olur (eskiden -1).
+     *
+     * Sadece TABAN seviyeler taranır; ara seviye artıklar STARTUP_CHECK'te birim
+     * olarak kredilendiği için burada tekrar sayılırsa çift sayım olurdu.
+     */
+    private void syncOpenStoragePage() {
+        for (Map.Entry<Book, Task> entry : task.entrySet()) {
+            Book book = entry.getKey();
+            Task t = entry.getValue();
+
+            int needed = t.getAmountToOrder();
+            if (needed <= 0) continue; // bu görev zaten dolu, kitap almasına gerek yok
+
+            int physicalHere = inventoryScanner.findLoreContainer(book.getRomanLevel(book.level())).size();
+            if (physicalHere <= 0) continue;
+
+            // Aynı isim + aynı taban seviyeye sahip başka görev yok (harita anahtarı
+            // Book), yani bu seviyedeki iddia sadece bu görevin iddiasıdır.
+            int unowned = physicalHere - t.inEnderChest;
+            if (unowned <= 0) continue;
+
+            int take = Math.min(unowned, needed);
+            t.addInEnderChest(take);
+            ChatUtils.clientMessage("Depoda " + take + "x " + book.getRomanLevel(book.level())
+                    + " sahipsiz kitap bulundu, siparis miktarindan dusuldu (kalan eksik: "
+                    + t.getAmountToOrder() + ").");
+        }
+    }
+
     private void openBazaar(String name) {
         if (containerCheck("bazaar")) return;
         debug("sending command for " + name);
@@ -1276,7 +1368,27 @@ public class BazaarFlipper implements Feature {
     }
 
     private void handleSign() {
-        String amountToOrder = String.valueOf(task.get(activeBook).getAmountToOrder());
+        Task signTask = task.get(activeBook);
+        if (signTask == null) {
+            debug("sign icin gorev yok, iptal");
+            minecraft.setScreen(null);
+            state = State.IDLE;
+            return;
+        }
+
+        // Tabelaya gelene kadar (depo taraması sayesinde) hedef dolmuş olabilir.
+        // Negatif/sıfır miktar yazmak Hypixel'de ya hata verir ya da havuzu tek
+        // sayıya kaydırırdı; artık sipariş hiç açılmıyor.
+        int orderAmount = signTask.getAmountToOrder();
+        if (orderAmount <= 0) {
+            debug("siparis gerekmiyor (eksik=" + orderAmount + "), tabela iptal ediliyor");
+            minecraft.setScreen(null);
+            editStateBook(activeBook, BookState.ANVIL);
+            state = State.IDLE;
+            return;
+        }
+
+        String amountToOrder = String.valueOf(orderAmount);
         if (minecraft.screen instanceof AbstractSignEditScreen signScreen) {
             debug("writing amount=" + amountToOrder + " for book=" + activeBook);
             try {
